@@ -1,0 +1,146 @@
+import 'dotenv/config';
+import { Telegraf } from 'telegraf';
+import cron from 'node-cron';
+import { listOpenIssues, createBranch, branchExists } from './github.js';
+import {
+  isIssueSeen,
+  markIssueSeen,
+  recordBranch,
+  listBranches,
+  logActivity,
+  recentActivity,
+} from './db.js';
+
+const {
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_OWNER_ID,
+  WATCHED_REPOS = '',
+  POLL_INTERVAL_MINUTES = '15',
+  REMINDER_CRON = '0 9 * * *',
+} = process.env;
+
+if (!TELEGRAM_BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN in .env');
+if (!TELEGRAM_OWNER_ID) throw new Error('Missing TELEGRAM_OWNER_ID in .env');
+
+const repos = WATCHED_REPOS.split(',').map((r) => r.trim()).filter(Boolean);
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+const ownerId = Number(TELEGRAM_OWNER_ID);
+
+// --- Every message and every action funnels through here so nothing
+// happens without you seeing it in the chat. ---
+async function notify(kind, message) {
+  logActivity(kind, message);
+  try {
+    await bot.telegram.sendMessage(ownerId, message, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Failed to send Telegram message:', err.message);
+  }
+}
+
+// Lock the bot to just you.
+bot.use((ctx, next) => {
+  if (ctx.from?.id !== ownerId) return; // silently ignore everyone else
+  return next();
+});
+
+bot.start((ctx) => {
+  ctx.reply(
+    'Drips Wave bot is running.\n\n' +
+      'Commands:\n' +
+      '/repos — list watched repos\n' +
+      '/checknow — poll GitHub for new issues right now\n' +
+      '/newbranch <repo> <branch> [issue#] — create a branch\n' +
+      '/branches — recent branches created\n' +
+      '/log — recent activity'
+  );
+});
+
+bot.command('repos', (ctx) => {
+  ctx.reply(repos.length ? repos.join('\n') : 'No repos configured — set WATCHED_REPOS in .env');
+});
+
+bot.command('checknow', async (ctx) => {
+  ctx.reply('Checking now…');
+  await pollIssues();
+});
+
+bot.command('branches', (ctx) => {
+  const rows = listBranches();
+  if (!rows.length) return ctx.reply('No branches created yet.');
+  ctx.reply(
+    rows
+      .map((b) => `${b.repo}: \`${b.branch_name}\`${b.issue_number ? ` (issue #${b.issue_number})` : ''}`)
+      .join('\n'),
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.command('log', (ctx) => {
+  const rows = recentActivity();
+  if (!rows.length) return ctx.reply('No activity yet.');
+  ctx.reply(rows.map((r) => `[${r.kind}] ${r.message}`).join('\n\n'));
+});
+
+// /newbranch owner/repo branch-name [issueNumber]
+bot.command('newbranch', async (ctx) => {
+  const parts = ctx.message.text.split(' ').slice(1);
+  const [repoFullName, branchName, issueNumberRaw] = parts;
+
+  if (!repoFullName || !branchName) {
+    return ctx.reply('Usage: /newbranch owner/repo branch-name [issue#]');
+  }
+  if (!repos.includes(repoFullName)) {
+    return ctx.reply(`${repoFullName} isn't in your watched repo list (/repos). Add it to WATCHED_REPOS first.`);
+  }
+
+  try {
+    if (await branchExists(repoFullName, branchName)) {
+      return ctx.reply(`Branch \`${branchName}\` already exists on ${repoFullName}.`, { parse_mode: 'Markdown' });
+    }
+    const { defaultBranch } = await createBranch(repoFullName, branchName);
+    const issueNumber = issueNumberRaw ? Number(issueNumberRaw) : null;
+    recordBranch(repoFullName, branchName, issueNumber);
+    await notify(
+      'branch',
+      `Created branch \`${branchName}\` on *${repoFullName}* off \`${defaultBranch}\`${issueNumber ? ` for issue #${issueNumber}` : ''}.`
+    );
+  } catch (err) {
+    await notify('error', `Failed to create branch on ${repoFullName}: ${err.message}`);
+  }
+});
+
+// --- Polling loop: new issues in watched repos ---
+async function pollIssues() {
+  for (const repo of repos) {
+    try {
+      const issues = await listOpenIssues(repo);
+      for (const issue of issues) {
+        if (isIssueSeen(repo, issue.number)) continue;
+        markIssueSeen(repo, issue.number, issue.title, issue.html_url);
+        await notify(
+          'issue',
+          `*New issue* on ${repo}\n${issue.title}\n${issue.html_url}`
+        );
+      }
+    } catch (err) {
+      await notify('error', `Failed to poll ${repo}: ${err.message}`);
+    }
+  }
+}
+
+// --- Scheduled reminder (default: daily 9am) ---
+cron.schedule(REMINDER_CRON, () => {
+  notify('reminder', 'Reminder: check on any pending Drips Wave applications, PRs, or withdrawal test transactions.');
+});
+
+// --- Poll GitHub on interval ---
+const intervalMs = Number(POLL_INTERVAL_MINUTES) * 60 * 1000;
+setInterval(pollIssues, intervalMs);
+
+bot.launch().then(() => {
+  console.log('Bot started.');
+  pollIssues(); // initial check on boot
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
